@@ -9,11 +9,27 @@ import warnings
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Comparable tickers for peer P/E (expand as needed). Used when no industry match.
+PEER_MAP: dict[str, list[str]] = {
+    "NVDA": ["AMD", "AVGO", "INTC", "MU", "QCOM"],
+    "AMD": ["NVDA", "AVGO", "INTC", "MU", "QCOM"],
+    "AAPL": ["MSFT", "GOOGL", "META", "AMZN"],
+    "MSFT": ["AAPL", "GOOGL", "META", "ORCL"],
+    "GOOGL": ["META", "MSFT", "AMZN"],
+    "META": ["GOOGL", "SNAP", "PINS"],
+    "TSLA": ["F", "GM", "RIVN"],
+    "JPM": ["BAC", "WFC", "C", "GS"],
+}
+SEMIS_PEERS = ["AMD", "AVGO", "INTC", "MU", "QCOM"]
+SOFTWARE_PEERS = ["MSFT", "ORCL", "CRM", "ADBE"]
 
 # ---------------------------------------------------------------------------
 # Data containers for yfinance + DCF outputs
@@ -29,6 +45,8 @@ class MarketData:
     forward_pe: float | None
     peg: float | None
     pb: float | None
+    peer_avg_pe: float | None  # Mean trailing P/E of comparable names (industry proxy)
+    peer_symbols_used: tuple[str, ...]  # Peers actually averaged
 
 
 @dataclass
@@ -76,18 +94,193 @@ def fetch_ticker_info(ticker: str) -> tuple[dict[str, Any], Any]:
     return info, t
 
 
-def extract_market_data(info: dict[str, Any], hist_close: float | None) -> MarketData:
-    """Build relative multiples and price from info and optional last close."""
+def compute_peer_average_pe(ticker: str, info: dict[str, Any]) -> tuple[float | None, tuple[str, ...]]:
+    """
+    Mean trailing P/E of a small peer set (industry proxy). Falls back to SPY/QQQ if unknown sector.
+    """
+    t_up = ticker.upper()
+    peers = list(PEER_MAP.get(t_up, []))
+    if not peers:
+        ind = (info.get("industry") or "").lower()
+        if any(x in ind for x in ("semiconductor", "semiconductors")):
+            peers = [p for p in SEMIS_PEERS if p.upper() != t_up]
+        elif "software" in ind:
+            peers = [p for p in SOFTWARE_PEERS if p.upper() != t_up]
+        else:
+            peers = ["SPY", "QQQ"]
+
+    pes: list[float] = []
+    used: list[str] = []
+    for sym in peers:
+        if sym.upper() == t_up:
+            continue
+        try:
+            inf = yf.Ticker(sym).info
+            pe = inf.get("trailingPE")
+            pe = _safe_float(pe)
+            if pe is not None and 0 < pe < 800:
+                pes.append(pe)
+                used.append(sym.upper())
+        except Exception:
+            continue
+
+    if not pes:
+        return None, tuple(peers)
+    return float(np.mean(pes)), tuple(used)
+
+
+def build_market_data(ticker: str, info: dict[str, Any], hist_close: float | None) -> MarketData:
+    """Price, multiples, and peer-average P/E."""
     price = _safe_float(
         hist_close if hist_close is not None else info.get("currentPrice") or info.get("regularMarketPrice")
     )
+    peer_avg, peer_used = compute_peer_average_pe(ticker, info)
     return MarketData(
         price=price,
         trailing_pe=_safe_float(info.get("trailingPE")),
         forward_pe=_safe_float(info.get("forwardPE")),
         peg=_safe_float(info.get("pegRatio")),
         pb=_safe_float(info.get("priceToBook")),
+        peer_avg_pe=peer_avg,
+        peer_symbols_used=peer_used,
     )
+
+
+def _quarterly_eps_series(t: yf.Ticker) -> pd.Series | None:
+    q = None
+    for attr in ("quarterly_income_stmt", "quarterly_financials"):
+        try:
+            cand = getattr(t, attr, None)
+            if cand is not None and not cand.empty:
+                q = cand
+                break
+        except Exception:
+            continue
+    if q is None or q.empty:
+        return None
+    for name in ("Diluted EPS", "Basic EPS", "Normalized EPS"):
+        if name in q.index:
+            s = q.loc[name]
+            s = pd.to_numeric(s, errors="coerce").dropna()
+            if s.empty:
+                continue
+            s.index = pd.to_datetime(s.index).tz_localize(None)
+            return s.sort_index()
+    return None
+
+
+def build_pe_river_data(ticker: str, years: int = 5) -> pd.DataFrame | None:
+    """
+    Monthly trailing P/E (price / TTM EPS) and rolling 25–75% band — 'P/E river' visualization.
+    """
+    t = yf.Ticker(ticker)
+    eps_q = _quarterly_eps_series(t)
+    if eps_q is None or len(eps_q) < 4:
+        return None
+
+    cols = list(eps_q.index)
+    ttm_idx: list[pd.Timestamp] = []
+    ttm_val: list[float] = []
+    for i in range(3, len(cols)):
+        window = [eps_q[c] for c in cols[i - 3 : i + 1]]
+        if any(pd.isna(x) for x in window):
+            continue
+        ttm = float(sum(float(x) for x in window))
+        if ttm <= 0:
+            continue
+        ttm_idx.append(pd.Timestamp(cols[i]))
+        ttm_val.append(ttm)
+
+    if not ttm_val:
+        return None
+    ttm_s = pd.Series(ttm_val, index=pd.DatetimeIndex(ttm_idx)).sort_index()
+
+    hist = t.history(period=f"{years}y", interval="1mo", auto_adjust=True)
+    if hist is None or hist.empty:
+        return None
+    close_m = hist["Close"].copy()
+    close_m.index = pd.to_datetime(close_m.index).tz_localize(None)
+
+    rows: list[dict[str, Any]] = []
+    for dt, px in close_m.items():
+        dt_ts = pd.Timestamp(dt)
+        ttm = ttm_s.asof(dt_ts)
+        if ttm is None or (isinstance(ttm, float) and np.isnan(ttm)):
+            continue
+        ttm_f = float(ttm)
+        if ttm_f <= 0:
+            continue
+        pxf = float(px)
+        if pxf <= 0:
+            continue
+        pe = pxf / ttm_f
+        if pe > 500 or pe < 0:
+            continue
+        rows.append({"date": dt_ts, "close": pxf, "ttm_eps": ttm_f, "pe": pe})
+
+    if len(rows) < 8:
+        return None
+    out = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+    win = int(min(24, max(6, len(out) // 3)))
+    out["pe_low"] = out["pe"].rolling(win, min_periods=4).quantile(0.25)
+    out["pe_high"] = out["pe"].rolling(win, min_periods=4).quantile(0.75)
+    out["pe_mid"] = out["pe"].rolling(win, min_periods=4).median()
+    return out
+
+
+def pe_river_figure(df: pd.DataFrame, ticker: str) -> go.Figure:
+    """Plotly: shaded band (rolling IQR) + trailing P/E line."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["pe_high"],
+            mode="lines",
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["pe_low"],
+            mode="lines",
+            line=dict(width=0),
+            fill="tonexty",
+            fillcolor="rgba(33, 150, 243, 0.18)",
+            name="P/E band (25–75% roll.)",
+            hoverinfo="skip",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["pe"],
+            mode="lines",
+            name="Trailing P/E",
+            line=dict(color="rgb(13, 71, 161)", width=2),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["pe_mid"],
+            mode="lines",
+            name="Rolling median P/E",
+            line=dict(color="rgba(100,100,100,0.7)", width=1, dash="dash"),
+        )
+    )
+    fig.update_layout(
+        title=f"{ticker.upper()} — P/E river chart (monthly, TTM EPS)",
+        xaxis_title="Date",
+        yaxis_title="Trailing P/E",
+        hovermode="x unified",
+        height=420,
+        margin=dict(l=40, r=20, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
 
 
 def _latest_annual_value(cf: pd.DataFrame, row_names: tuple[str, ...]) -> float | None:
@@ -300,7 +493,7 @@ def main() -> None:
         info, t = fetch_ticker_info(ticker)
         hist = t.history(period="5d")
         close_px = float(hist["Close"].iloc[-1]) if hist is not None and not hist.empty else None
-        market = extract_market_data(info, close_px)
+        market = build_market_data(ticker, info, close_px)
         fundamentals = build_fundamental_inputs(t, info)
     except Exception as e:
         st.error(f"Data fetch failed: {e}")
@@ -326,7 +519,7 @@ def main() -> None:
         dcf_error = f"DCF error: {e}"
 
     st.subheader("1. Fundamentals & relative valuation")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
         st.metric("Last price (USD)", f"${market.price:,.2f}" if market.price else "—")
     with c2:
@@ -337,6 +530,32 @@ def main() -> None:
         st.metric("PEG", f"{market.peg:.2f}" if market.peg else "—")
     with c5:
         st.metric("P/B", f"{market.pb:.2f}" if market.pb else "—")
+    with c6:
+        st.metric(
+            "Peer avg P/E",
+            f"{market.peer_avg_pe:.2f}" if market.peer_avg_pe else "—",
+        )
+    st.caption(
+        "**Peer avg P/E (industry proxy):** mean trailing P/E of comparable tickers — "
+        f"{', '.join(market.peer_symbols_used) if market.peer_symbols_used else 'none resolved'}."
+    )
+
+    st.markdown("##### P/E river chart (trailing)")
+    river_df: pd.DataFrame | None = None
+    try:
+        river_df = build_pe_river_data(ticker)
+    except Exception:
+        river_df = None
+    if river_df is not None and not river_df.empty:
+        st.plotly_chart(pe_river_figure(river_df, ticker), width="stretch")
+        st.caption(
+            "Shaded band = rolling 25th–75th percentile of monthly trailing P/E; "
+            "solid line = trailing P/E (price ÷ TTM EPS); dashed = rolling median."
+        )
+    else:
+        st.info(
+            "P/E river chart could not be built (need quarterly EPS history and enough overlapping months)."
+        )
 
     if fundamentals.used_defaults:
         with st.expander("Data gaps (defaults or substitutes applied)", expanded=False):
