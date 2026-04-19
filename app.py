@@ -1,7 +1,6 @@
 """
-股票估值區間分析儀表板 (Stock Valuation Dashboard)
-以 yfinance 抓取資料、兩階段 DCF 估算每股內在價值，並以 Streamlit 互動呈現。
-所有邏輯集中於本檔案。
+Stock Valuation Dashboard — single-file Streamlit app.
+Fetches data via yfinance, runs a two-stage DCF for intrinsic value per share.
 """
 
 from __future__ import annotations
@@ -17,13 +16,13 @@ import yfinance as yf
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ---------------------------------------------------------------------------
-# 資料結構：匯總從 yfinance 與 DCF 計算之結果，便於傳遞至 UI
+# Data containers for yfinance + DCF outputs
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class MarketData:
-    """市場價格與相對估值乘數。"""
+    """Spot price and relative valuation multiples."""
 
     price: float | None
     trailing_pe: float | None
@@ -34,28 +33,28 @@ class MarketData:
 
 @dataclass
 class FundamentalInputs:
-    """DCF 所需之基本面輸入（已做缺漏處理）。"""
+    """Fundamental inputs for DCF (with fallbacks applied)."""
 
-    fcf_base: float  # 最近一期推算之自由現金流（美元）
-    shares: float  # 流通在外股數
-    net_debt: float  # 淨負債 = 總負債 - 現金（美元）；可為負（淨現金）
-    used_defaults: list[str]  # 哪些欄位使用預設值，供 UI 提示
+    fcf_base: float  # Implied base-year FCF (USD)
+    shares: float  # Shares outstanding
+    net_debt: float  # Total debt minus cash (USD); can be negative (net cash)
+    used_defaults: list[str]  # Human-readable notes when defaults were used
 
 
 @dataclass
 class DCFResult:
-    """兩階段 DCF 輸出。"""
+    """Two-stage DCF outputs."""
 
     intrinsic_per_share: float
-    band_low: float  # 內在價值 -10%
-    band_high: float  # 內在價值 +10%
+    band_low: float  # intrinsic -10%
+    band_high: float  # intrinsic +10%
     enterprise_value: float
     pv_fcf_5y: float
     pv_terminal: float
 
 
 # ---------------------------------------------------------------------------
-# yfinance：抓取股價、乘數、現金流與資產負債相關欄位
+# yfinance: price, multiples, cash flows, balance sheet
 # ---------------------------------------------------------------------------
 
 
@@ -69,16 +68,16 @@ def _safe_float(x: Any, default: float | None = None) -> float | None:
 
 
 def fetch_ticker_info(ticker: str) -> tuple[dict[str, Any], Any]:
-    """回傳 (info 字典, Ticker 物件)。失敗時拋出例外由外層處理。"""
+    """Return (info dict, Ticker). Raises if fundamentals are unavailable."""
     t = yf.Ticker(ticker)
     info = t.info
     if not info:
-        raise ValueError(f"無法取得 {ticker} 的基本面資訊（info 為空）。")
+        raise ValueError(f"Could not load fundamentals for {ticker} (empty info).")
     return info, t
 
 
 def extract_market_data(info: dict[str, Any], hist_close: float | None) -> MarketData:
-    """從 info 與可選歷史收盤價組裝相對估值與現價。"""
+    """Build relative multiples and price from info and optional last close."""
     price = _safe_float(
         hist_close if hist_close is not None else info.get("currentPrice") or info.get("regularMarketPrice")
     )
@@ -92,13 +91,12 @@ def extract_market_data(info: dict[str, Any], hist_close: float | None) -> Marke
 
 
 def _latest_annual_value(cf: pd.DataFrame, row_names: tuple[str, ...]) -> float | None:
-    """從現金流量表取最近一年度之列（欄位為日期，取第一欄通常為最新年）。"""
+    """Latest annual value from cash flow statement (iterate columns for first non-null)."""
     if cf is None or cf.empty:
         return None
     for name in row_names:
         if name in cf.index:
             row = cf.loc[name]
-            # 取第一個非空數值（yfinance 年報常為最新期在左）
             for col in cf.columns:
                 v = row[col]
                 if v is not None and not (isinstance(v, float) and pd.isna(v)):
@@ -107,7 +105,7 @@ def _latest_annual_value(cf: pd.DataFrame, row_names: tuple[str, ...]) -> float 
 
 
 def _latest_bs_value(bs: pd.DataFrame, row_names: tuple[str, ...]) -> float | None:
-    """資產負債表取最近一期。"""
+    """Latest value from balance sheet."""
     if bs is None or bs.empty:
         return None
     for name in row_names:
@@ -122,8 +120,8 @@ def _latest_bs_value(bs: pd.DataFrame, row_names: tuple[str, ...]) -> float | No
 
 def build_fundamental_inputs(t: yf.Ticker, info: dict[str, Any]) -> FundamentalInputs:
     """
-    推算 FCF = 營運現金流 + 資本支出（CapEx 在報表上多為負值）。
-    股數、淨負債優先由 info，失敗則由資產負債表。
+    FCF = Operating cash flow + Capital expenditure (CapEx is usually negative).
+    Shares and net debt: prefer info, else balance sheet.
     """
     used_defaults: list[str] = []
     cf = None
@@ -131,7 +129,7 @@ def build_fundamental_inputs(t: yf.Ticker, info: dict[str, Any]) -> FundamentalI
     try:
         cf = t.cashflow
     except Exception:
-        used_defaults.append("現金流量表下載失敗")
+        used_defaults.append("Cash flow statement download failed")
 
     ocf = _latest_annual_value(
         cf if cf is not None else pd.DataFrame(),
@@ -144,12 +142,12 @@ def build_fundamental_inputs(t: yf.Ticker, info: dict[str, Any]) -> FundamentalI
 
     if ocf is None:
         ocf = 0.0
-        used_defaults.append("營運現金流缺失，FCF 之營運部分以 0 計")
+        used_defaults.append("Operating cash flow missing; OCF in FCF set to 0")
     if capex is None:
         capex = 0.0
-        used_defaults.append("資本支出缺失，FCF 之 CapEx 以 0 計")
+        used_defaults.append("CapEx missing; CapEx in FCF set to 0")
 
-    # CapEx 通常為負：FCF = OCF + CapEx
+    # CapEx is usually negative: FCF = OCF + CapEx
     fcf_base = float(ocf) + float(capex)
 
     shares = _safe_float(info.get("sharesOutstanding"))
@@ -161,10 +159,12 @@ def build_fundamental_inputs(t: yf.Ticker, info: dict[str, Any]) -> FundamentalI
                 shares = float(sh_row)
             else:
                 shares = 1.0
-                used_defaults.append("流通在外股數缺失，每股價值分母暫用 1（僅供展示，請勿作實盤）")
+                used_defaults.append(
+                    "Shares outstanding missing; denominator set to 1 (illustrative only, not for trading)"
+                )
         except Exception:
             shares = 1.0
-            used_defaults.append("流通在外股數缺失，每股價值分母暫用 1")
+            used_defaults.append("Shares outstanding missing; denominator set to 1")
 
     total_debt = _safe_float(info.get("totalDebt"))
     total_cash = _safe_float(info.get("totalCash"))
@@ -175,10 +175,10 @@ def build_fundamental_inputs(t: yf.Ticker, info: dict[str, Any]) -> FundamentalI
             td = _latest_bs_value(bs, ("Total Debt", "Long Term Debt"))
             total_debt = td if td is not None else 0.0
             if td is None:
-                used_defaults.append("總負債由缺省改為 0")
+                used_defaults.append("Total debt defaulted to 0")
         except Exception:
             total_debt = 0.0
-            used_defaults.append("總負債缺失改為 0")
+            used_defaults.append("Total debt missing; set to 0")
     if total_cash is None:
         try:
             if bs is None:
@@ -189,10 +189,10 @@ def build_fundamental_inputs(t: yf.Ticker, info: dict[str, Any]) -> FundamentalI
             )
             total_cash = tc if tc is not None else 0.0
             if tc is None:
-                used_defaults.append("現金缺失改為 0")
+                used_defaults.append("Cash defaulted to 0")
         except Exception:
             total_cash = 0.0
-            used_defaults.append("現金缺失改為 0")
+            used_defaults.append("Cash missing; set to 0")
 
     net_debt = float(total_debt) - float(total_cash)
 
@@ -205,7 +205,7 @@ def build_fundamental_inputs(t: yf.Ticker, info: dict[str, Any]) -> FundamentalI
 
 
 # ---------------------------------------------------------------------------
-# DCF：兩階段（5 年明確成長 + Gordon 成長終值）
+# DCF: two-stage (5-year explicit growth + Gordon terminal value)
 # ---------------------------------------------------------------------------
 
 
@@ -218,18 +218,17 @@ def run_two_stage_dcf(
     shares: float,
 ) -> DCFResult | None:
     """
-    第一階段：FCF_t = FCF_{t-1} * (1+g)，t=1..5，各期折現。
-    第二階段：TV = FCF_5*(1+g_term)/(WACC-g_term)，折現至今日。
-    企業價值 EV = PV(FCF1..5) + PV(TV)；股權價值 = EV - 淨負債；每股 = 股權/股數。
-    估值區間：每股內在價值 ±10%。
+    Stage 1: FCF_t = FCF_{t-1} * (1+g), t=1..5, discount each year.
+    Stage 2: TV = FCF_5*(1+g_term)/(WACC-g_term), discount to today.
+    EV = PV(FCF1..5) + PV(TV); equity = EV - net debt; per share = equity / shares.
+    Fair band: intrinsic per share ±10%.
     """
     if shares <= 0:
         return None
     if wacc <= terminal_growth:
-        raise ValueError("WACC 必須大於永續成長率，否則終值公式不成立。")
+        raise ValueError("WACC must exceed terminal growth (terminal value formula requires it).")
     if fcf0 <= 0:
-        # 仍允許計算但可能不具經濟意義，由 UI 提示
-        pass
+        pass  # still compute; may be economically weak — surfaced in UI
 
     pv_fcf = 0.0
     fcf_prev = fcf0
@@ -238,7 +237,7 @@ def run_two_stage_dcf(
         pv_fcf += fcf_t / ((1.0 + wacc) ** t)
         fcf_prev = fcf_t
 
-    fcf5 = fcf_prev  # 第 5 年終了之 FCF
+    fcf5 = fcf_prev
     tv = fcf5 * (1.0 + terminal_growth) / (wacc - terminal_growth)
     pv_terminal = tv / ((1.0 + wacc) ** 5)
 
@@ -260,43 +259,42 @@ def run_two_stage_dcf(
 
 
 # ---------------------------------------------------------------------------
-# 安全邊際文字與簡易視覺化資料
+# Valuation label + chart helpers
 # ---------------------------------------------------------------------------
 
 
 def classify_valuation(price: float | None, low: float, high: float) -> str:
-    """依當前股價與合理區間 [low, high] 給出繁中標籤。"""
+    """Map spot price vs [low, high] fair band to a short English label."""
     if price is None or price <= 0:
-        return "無法判定（缺少股價）"
+        return "Unable to classify (no price)"
     if price < low:
-        return "嚴重低估（低於合理區間下緣）"
+        return "Materially undervalued (below fair band)"
     if price <= high:
-        return "合理（落在估值區間內）"
-    return "高估（高於合理區間上緣）"
+        return "Fair (within valuation band)"
+    return "Overvalued (above fair band)"
 
 
 # ---------------------------------------------------------------------------
-# Streamlit 主程式
+# Streamlit UI
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    st.set_page_config(page_title="股票估值區間分析", layout="wide")
-    st.title("股票估值區間分析儀表板")
-    st.caption("資料來源：yfinance｜絕對估值採簡化兩階段 DCF，僅供教育與研究，非投資建議。")
+    st.set_page_config(page_title="Stock Valuation Dashboard", layout="wide")
+    st.title("Stock Valuation Dashboard")
+    st.caption(
+        "Data: yfinance — simplified two-stage DCF for education/research only, not investment advice."
+    )
 
-    # --- 側邊欄參數 ---
     with st.sidebar:
-        st.header("標的與 DCF 參數")
-        ticker = st.text_input("股票代號", value="NVDA").strip().upper() or "NVDA"
-        g5 = st.slider("未來 5 年預估 FCF 成長率 (%)", 0, 100, 20, format="%d%%") / 100.0
-        g_term = st.slider("永續成長率 Terminal Growth (%)", 1, 5, 3, format="%d%%") / 100.0
-        wacc = st.slider("折現率 WACC (%)", 5, 20, 10, format="%d%%") / 100.0
+        st.header("Ticker & DCF inputs")
+        ticker = st.text_input("Ticker symbol", value="NVDA").strip().upper() or "NVDA"
+        g5 = st.slider("5-year FCF growth rate (annual, %)", 0, 100, 20, format="%d%%") / 100.0
+        g_term = st.slider("Terminal growth rate (%)", 1, 5, 3, format="%d%%") / 100.0
+        wacc = st.slider("Discount rate WACC (%)", 5, 20, 10, format="%d%%") / 100.0
 
-    # --- 抓取資料 ---
     market: MarketData | None = None
     fundamentals: FundamentalInputs | None = None
-    err_msg: str | None = None
 
     try:
         info, t = fetch_ticker_info(ticker)
@@ -305,14 +303,12 @@ def main() -> None:
         market = extract_market_data(info, close_px)
         fundamentals = build_fundamental_inputs(t, info)
     except Exception as e:
-        err_msg = str(e)
-        st.error(f"資料抓取失敗：{err_msg}")
-        st.info("請確認代號正確、網路正常，或稍後再試。")
+        st.error(f"Data fetch failed: {e}")
+        st.info("Check the ticker, network, or try again later.")
         return
 
     assert market is not None and fundamentals is not None
 
-    # --- DCF 計算 ---
     dcf: DCFResult | None = None
     dcf_error: str | None = None
     try:
@@ -327,49 +323,47 @@ def main() -> None:
     except ValueError as e:
         dcf_error = str(e)
     except Exception as e:
-        dcf_error = f"DCF 計算異常：{e}"
+        dcf_error = f"DCF error: {e}"
 
-    # --- 區塊一：基本面與相對估值 ---
-    st.subheader("一、基本面與相對估值")
+    st.subheader("1. Fundamentals & relative valuation")
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
-        st.metric("目前股價 (USD)", f"${market.price:,.2f}" if market.price else "—")
+        st.metric("Last price (USD)", f"${market.price:,.2f}" if market.price else "—")
     with c2:
         st.metric("Trailing P/E", f"{market.trailing_pe:.2f}" if market.trailing_pe else "—")
     with c3:
         st.metric("Forward P/E", f"{market.forward_pe:.2f}" if market.forward_pe else "—")
     with c4:
-        st.metric("PEG Ratio", f"{market.peg:.2f}" if market.peg else "—")
+        st.metric("PEG", f"{market.peg:.2f}" if market.peg else "—")
     with c5:
         st.metric("P/B", f"{market.pb:.2f}" if market.pb else "—")
 
     if fundamentals.used_defaults:
-        with st.expander("資料缺漏提示（已使用預設或替代值）", expanded=False):
+        with st.expander("Data gaps (defaults or substitutes applied)", expanded=False):
             for line in fundamentals.used_defaults:
                 st.warning(line)
 
     st.divider()
 
-    # --- 區塊二：DCF 絕對估值 ---
-    st.subheader("二、DCF 絕對估值（兩階段）")
+    st.subheader("2. Absolute valuation — two-stage DCF")
     col_a, col_b = st.columns(2)
     with col_a:
         st.markdown(
             f"""
-| 項目 | 數值 |
-|------|------|
-| 基期自由現金流 FCF₀（推算） | {fundamentals.fcf_base:,.0f} USD |
-| 流通在外股數 | {fundamentals.shares:,.0f} |
-| 淨負債（總負債−現金） | {fundamentals.net_debt:,.0f} USD |
+| Item | Value |
+|------|-------|
+| Base-year FCF (implied) | {fundamentals.fcf_base:,.0f} USD |
+| Shares outstanding | {fundamentals.shares:,.0f} |
+| Net debt (debt − cash) | {fundamentals.net_debt:,.0f} USD |
 """
         )
     with col_b:
         st.markdown(
             f"""
-| DCF 參數 | 設定 |
-|----------|------|
-| 5 年 FCF 年化成長 | {g5*100:.1f}% |
-| 永續成長率 | {g_term*100:.1f}% |
+| DCF input | Setting |
+|-----------|---------|
+| 5-year FCF growth | {g5*100:.1f}% |
+| Terminal growth | {g_term*100:.1f}% |
 | WACC | {wacc*100:.1f}% |
 """
         )
@@ -379,36 +373,32 @@ def main() -> None:
     elif dcf is not None:
         m1, m2, m3 = st.columns(3)
         with m1:
-            st.metric("每股內在價值（估計）", f"${dcf.intrinsic_per_share:,.2f}")
+            st.metric("Intrinsic value / share (est.)", f"${dcf.intrinsic_per_share:,.2f}")
         with m2:
-            st.metric("合理區間下緣 (−10%)", f"${dcf.band_low:,.2f}")
+            st.metric("Fair band low (−10%)", f"${dcf.band_low:,.2f}")
         with m3:
-            st.metric("合理區間上緣 (+10%)", f"${dcf.band_high:,.2f}")
+            st.metric("Fair band high (+10%)", f"${dcf.band_high:,.2f}")
         st.caption(
-            f"企業價值 EV ≈ {dcf.enterprise_value:,.0f} USD｜"
-            f"5 年 FCF 現值 {dcf.pv_fcf_5y:,.0f}｜終值現值 {dcf.pv_terminal:,.0f}"
+            f"EV ≈ {dcf.enterprise_value:,.0f} USD — PV(5y FCF) {dcf.pv_fcf_5y:,.0f} — PV(terminal) {dcf.pv_terminal:,.0f}"
         )
     else:
-        st.warning("無法完成 DCF（請檢查輸入與資料）。")
+        st.warning("DCF could not be completed — check inputs and data.")
 
     st.divider()
 
-    # --- 區塊三：安全邊際 ---
-    st.subheader("三、安全邊際與股價對照")
+    st.subheader("3. Margin of safety vs spot price")
     if dcf is not None and market.price:
         label = classify_valuation(market.price, dcf.band_low, dcf.band_high)
-        st.markdown(f"### 結論：**{label}**")
+        st.markdown(f"### Verdict: **{label}**")
 
-        # 以長條圖對比：區間與現價（單位：美元）
         chart_df = pd.DataFrame(
             {
-                "項目": ["合理區間下緣", "目前股價", "每股內在價值", "合理區間上緣"],
+                "Item": ["Fair band low", "Spot price", "Intrinsic / share", "Fair band high"],
                 "USD": [dcf.band_low, market.price, dcf.intrinsic_per_share, dcf.band_high],
             }
-        ).set_index("項目")
+        ).set_index("Item")
         st.bar_chart(chart_df)
 
-        # 進度條：現價在 [0.8*low, 1.2*high] 線性映射（簡化視覺）
         lo = min(dcf.band_low * 0.85, market.price * 0.5)
         hi = max(dcf.band_high * 1.15, market.price * 1.5)
         if hi > lo:
@@ -417,9 +407,9 @@ def main() -> None:
         else:
             pct = 0.5
         st.progress(pct)
-        st.caption(f"進度條為股價在參考刻度上的相對位置（僅示意；約 {lo:.1f} ~ {hi:.1f} USD）。")
+        st.caption(f"Progress bar: relative spot price on a schematic scale (~{lo:.1f}–{hi:.1f} USD).")
     else:
-        st.info("缺少股價或 DCF 結果，無法顯示安全邊際圖表。")
+        st.info("Need both spot price and DCF output to show margin-of-safety chart.")
 
 
 if __name__ == "__main__":
